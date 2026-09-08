@@ -2,7 +2,7 @@
 Web UI for interactive Neuroglancer Zarr v3 link generation.
 """
 
-UI_HTML = """<!DOCTYPE html>
+UI_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -745,12 +745,12 @@ UI_HTML = """<!DOCTYPE html>
                         </span>
                         <span class="tag">S3, HTTPS, or Local</span>
                     </label>
-                    <input type="text" id="src_url" value="s3://neuroglancer-janelia-flyem-hemibrain/v1.2/groundtruth.zarr" placeholder="s3://bucket/path/to/dataset.zarr" />
+                    <input type="text" id="src_url" value="https://storage.googleapis.com/ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr" placeholder="s3://bucket/path/to/dataset.zarr" />
                     <div class="presets-row">
-                        <button type="button" class="preset-btn" onclick="setPreset('zarr://gs://ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr/')">HGIA Heart (gs://)</button>
-                        <button type="button" class="preset-btn" onclick="setPreset('https://storage.googleapis.com/ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr')">HGIA Heart (HTTPS)</button>
-                        <button type="button" class="preset-btn" onclick="setPreset('s3://neuroglancer-janelia-flyem-hemibrain/v1.2/groundtruth.zarr')">Janelia FlyEM (S3)</button>
+                        <button type="button" class="preset-btn" onclick="setPreset('https://storage.googleapis.com/ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr')">UCL HiP-CT Heart (HTTPS)</button>
+                        <button type="button" class="preset-btn" onclick="setPreset('gs://ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr')">UCL HiP-CT Heart (gs://)</button>
                     </div>
+
                 </div>
             </div>
 

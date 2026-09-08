@@ -199,10 +199,15 @@ def _open_zarr_array_sync(src_url: str, array_subpath: str) -> zarr.Array:
     Synchronously open a Zarr v3 array with automated codec & sharding handling.
     """
     full_url = join_url(src_url, array_subpath) if array_subpath else src_url
+    if full_url.startswith("zarr://"):
+        full_url = full_url[7:]
+    elif full_url.startswith("zarr3://"):
+        full_url = full_url[8:]
     if full_url.startswith("gs://"):
         full_url = f"https://storage.googleapis.com/{full_url[5:].lstrip('/')}"
     elif full_url.startswith("gcs://"):
         full_url = f"https://storage.googleapis.com/{full_url[6:].lstrip('/')}"
+
     if full_url.startswith("s3://") and not (os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_PROFILE")):
         return zarr.open_array(full_url, mode="r", storage_options={"anon": True})
     return zarr.open_array(full_url, mode="r")

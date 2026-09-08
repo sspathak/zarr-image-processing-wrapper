@@ -140,3 +140,22 @@ def test_codec_roundtrip():
             codecs_spec.append({"name": comp, "configuration": {"cname": "zstd", "level": 5, "clevel": 5}})
         decoded = decode_chunk_bytes(compressed, codecs_spec, (32, 32, 32), "uint8")
         assert np.array_equal(arr, decoded)
+
+
+def test_filters_with_ct_intensity_windowing():
+    """
+    Verify that 16-bit CT volumes with high baseline intensity (e.g. 20,000)
+    and an intensity window (vmin=18000, vmax=26000) produce valid outputs for
+    all filter methods (Frangi, Sato, Otsu, Gaussian, Identity) without clipping to zero.
+    """
+    vol = np.full((32, 32, 32), 22000.0, dtype=np.float32)
+    vol[16, :, 16] = 25000.0  # Bright tube
+    params = {"vmin": 18000, "vmax": 26000, "sigmas": [1.5], "sigma": 1.5, "black_ridges": False}
+
+    for method in ["identity", "gaussian", "frangi", "sato", "threshold_otsu"]:
+        out = apply_filter(volume=vol, method=method, params=params, target_dtype="uint8", normalize=True)
+        assert out.shape == (32, 32, 32)
+        assert out.dtype == np.uint8
+        assert out.max() > 0, f"Method {method} produced all zeros on CT windowed data!"
+        assert out[16, 16, 16] > out[0, 0, 0], f"Method {method} failed to highlight the vessel!"
+

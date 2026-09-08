@@ -60,6 +60,7 @@ def normalize_and_cast(
     arr: np.ndarray,
     target_dtype: str = "uint8",
     normalize: bool = True,
+    method: str = "identity",
     params: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """
@@ -67,6 +68,8 @@ def normalize_and_cast(
     """
     params = params or {}
     dt = np.dtype(target_dtype)
+    m = method.lower()
+    max_target = 255.0 if dt == np.uint8 else (65535.0 if dt == np.uint16 else 1.0)
 
     # Check for thresholding / binarization request
     if "threshold" in params:
@@ -79,27 +82,40 @@ def normalize_and_cast(
         else:
             return binary.astype(dt)
 
+    if m in ("threshold_otsu", "otsu"):
+        if dt == np.uint8:
+            return (arr * 255).astype(np.uint8)
+        elif dt == np.uint16:
+            return (arr * 65535).astype(np.uint16)
+        else:
+            return arr.astype(dt)
+
     if np.issubdtype(dt, np.floating):
+        if normalize and m in ("frangi", "sato"):
+            mx = float(np.nanmax(arr))
+            if mx > 0:
+                return (arr / mx).astype(dt)
         return arr.astype(dt)
 
     if not normalize:
+        if m in ("frangi", "sato"):
+            # For Frangi/Sato when unnormalized to integer: map [0, 1] to target integer range
+            return np.clip(arr * max_target, 0, max_target).astype(dt)
         return np.clip(arr, np.iinfo(dt).min, np.iinfo(dt).max).astype(dt)
 
     # Dynamic or explicit range normalization
-    vmin = params.get("vmin")
-    vmax = params.get("vmax")
-
-    if vmin is not None:
-        min_val = float(vmin)
+    if m in ("frangi", "sato"):
+        # Output is vesselness response [0, max_val], not original raw CT units (vmin/vmax)
+        min_val = 0.0
+        if "out_vmax" in params:
+            max_val = float(params["out_vmax"])
+        else:
+            max_val = float(np.nanmax(arr)) if np.nanmax(arr) > 0 else 1.0
     else:
-        min_val = float(np.nanmin(arr))
-
-    if vmax is not None:
-        max_val = float(vmax)
-    else:
-        max_val = float(np.nanmax(arr))
-
-    max_target = 255.0 if dt == np.uint8 else 65535.0
+        vmin = params.get("vmin")
+        vmax = params.get("vmax")
+        min_val = float(vmin) if vmin is not None else float(np.nanmin(arr))
+        max_val = float(vmax) if vmax is not None else float(np.nanmax(arr))
 
     if max_val > min_val:
         scaled = (arr - min_val) / (max_val - min_val) * max_target
@@ -121,7 +137,19 @@ def apply_filter(
     Apply volumetric filter to an assembled 3D subvolume.
     """
     m = method.lower()
+    params = params or {}
     input_float = volume.astype(np.float32, copy=False)
+
+    vmin = params.get("vmin")
+    vmax = params.get("vmax")
+    has_window = vmin is not None and vmax is not None and float(vmax) > float(vmin)
+
+    # For feature detectors (Frangi, Sato, Otsu), if raw CT windowing vmin/vmax is given,
+    # pre-condition input to [0, 1] so Hessian and thresholding operate on the contrast-enhanced tissue window.
+    if has_window and m in ("frangi", "sato", "threshold_otsu", "otsu"):
+        input_proc = np.clip((input_float - float(vmin)) / (float(vmax) - float(vmin)), 0.0, 1.0)
+    else:
+        input_proc = input_float
 
     if m == "frangi":
         sigmas = params.get("sigmas", [1.0, 2.0])
@@ -133,7 +161,7 @@ def apply_filter(
         cval = float(params.get("cval", 0.0))
 
         filtered = frangi(
-            input_float,
+            input_proc,
             sigmas=sigmas,
             alpha=alpha,
             beta=beta,
@@ -150,7 +178,7 @@ def apply_filter(
         cval = float(params.get("cval", 0.0))
 
         filtered = sato(
-            input_float,
+            input_proc,
             sigmas=sigmas,
             black_ridges=black_ridges,
             mode=mode,
@@ -163,7 +191,7 @@ def apply_filter(
         cval = float(params.get("cval", 0.0))
 
         filtered = gaussian(
-            input_float,
+            input_proc,
             sigma=sigma,
             mode=mode,
             cval=cval,
@@ -171,23 +199,24 @@ def apply_filter(
         )
 
     elif m in ("threshold_otsu", "otsu"):
-        if input_float.max() > input_float.min():
-            th = threshold_otsu(input_float)
-            filtered = (input_float >= th).astype(np.float32)
+        if input_proc.max() > input_proc.min():
+            th = threshold_otsu(input_proc)
+            filtered = (input_proc >= th).astype(np.float32)
         else:
-            filtered = np.zeros_like(input_float)
+            filtered = np.zeros_like(input_proc)
 
     elif m == "constant":
         val = float(params.get("value", 42.0))
-        filtered = np.full_like(input_float, val)
+        filtered = np.full_like(input_proc, val)
 
     elif m == "identity":
-        filtered = input_float
+        filtered = input_proc
 
     else:
         raise ValueError(f"Unknown filter method '{method}'")
 
-    return normalize_and_cast(filtered, target_dtype=target_dtype, normalize=normalize, params=params)
+    return normalize_and_cast(filtered, target_dtype=target_dtype, normalize=normalize, method=m, params=params)
+
 
 
 def apply_filter_dask(

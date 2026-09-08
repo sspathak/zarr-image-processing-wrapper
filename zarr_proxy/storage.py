@@ -66,10 +66,15 @@ async def fetch_bytes(base_url: str, subpath: str) -> Optional[bytes]:
     Returns None if the resource does not exist (404/NoSuchKey).
     """
     full_url = join_url(base_url, subpath)
+    if full_url.startswith("zarr://"):
+        full_url = full_url[7:]
+    elif full_url.startswith("zarr3://"):
+        full_url = full_url[8:]
     if full_url.startswith("gs://"):
         full_url = f"https://storage.googleapis.com/{full_url[5:].lstrip('/')}"
     elif full_url.startswith("gcs://"):
         full_url = f"https://storage.googleapis.com/{full_url[6:].lstrip('/')}"
+
 
     parsed = urlparse(full_url)
 

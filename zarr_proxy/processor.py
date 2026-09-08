@@ -1,6 +1,7 @@
 """
 Zarr v3 Chunk Processing Engine:
-Coordinate parsing, concurrent halo fetching, stitching, filtering, and caching.
+Dask-powered lazy array representation, transparent chunk caching,
+on-demand localized graph execution, volumetric filtering, and encoding.
 Supports all Zarr v3 codecs (including sharding_indexed, blosc, zstd, gzip).
 """
 
@@ -10,6 +11,8 @@ import asyncio
 import itertools
 import os
 from typing import Any, Dict, List, Optional, Tuple
+import dask
+import dask.array as da
 import numpy as np
 import zarr
 
@@ -29,6 +32,10 @@ _meta_lock = asyncio.Lock()
 # Cached zarr.Array objects for high-performance subvolume slicing
 _zarr_array_cache: Dict[Tuple[str, str], zarr.Array] = {}
 _zarr_array_lock = asyncio.Lock()
+
+# Cached Dask Array objects wrapping CachedZarrArray
+_dask_array_cache: Dict[Tuple[str, str], da.Array] = {}
+_dask_array_lock = asyncio.Lock()
 
 
 def resolve_array_and_chunk(zarr_path: str) -> Tuple[str, str]:
@@ -216,28 +223,151 @@ async def get_zarr_array(src_url: str, array_subpath: str) -> zarr.Array:
         return arr
 
 
+class CachedZarrArray:
+    """
+    Adapter wrapping a zarr.Array so that chunk reads initiated by Dask
+    are transparently cached in and read from the thread-safe, byte-bounded RawChunkCache.
+    """
+
+    def __init__(self, zarr_arr: zarr.Array, src_url: str, array_subpath: str = ""):
+        self.zarr_arr = zarr_arr
+        self.src_url = src_url
+        self.array_subpath = array_subpath
+        self.raw_cache = get_raw_chunk_cache()
+        self.shape = zarr_arr.shape
+        self.dtype = zarr_arr.dtype
+        self.ndim = zarr_arr.ndim
+
+    def __getitem__(self, item: Any) -> np.ndarray:
+        if not isinstance(item, tuple):
+            item = (item,)
+        normalized = []
+        for i, s in enumerate(item):
+            d = self.shape[i] if i < len(self.shape) else 0
+            if isinstance(s, slice):
+                start = 0 if s.start is None else s.start
+                stop = d if s.stop is None else s.stop
+                normalized.append((start, stop))
+            else:
+                normalized.append((int(s), int(s) + 1))
+
+        cache_key = (self.src_url, self.array_subpath, tuple(normalized))
+        cached = self.raw_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        data = np.asarray(self.zarr_arr[item])
+        self.raw_cache.put(cache_key, data)
+        return data
+
+
+async def get_dask_array(src_url: str, array_subpath: str = "") -> da.Array:
+    """
+    Retrieve or initialize a lazy Dask array for the specified Zarr dataset.
+    Backed by CachedZarrArray so that all chunk reads pass through the RawChunkCache.
+    """
+    key = (src_url, array_subpath)
+    if key in _dask_array_cache:
+        return _dask_array_cache[key]
+    async with _dask_array_lock:
+        if key in _dask_array_cache:
+            return _dask_array_cache[key]
+        zarr_arr = await get_zarr_array(src_url, array_subpath)
+        cached_wrapper = CachedZarrArray(zarr_arr, src_url, array_subpath)
+        darr = da.from_array(cached_wrapper, chunks=zarr_arr.chunks)
+        _dask_array_cache[key] = darr
+        return darr
+
+
+async def get_filtered_dask_array(
+    config: ProxyConfig,
+    array_subpath: str = "",
+) -> da.Array:
+    """
+    Construct a lazy Dask array representing the entire filtered dataset.
+    Applies spatial overlap (halo) handling and volumetric filtering via Dask map_overlap/map_blocks.
+    """
+    darr = await get_dask_array(config.src_url, array_subpath)
+    from zarr_proxy.filters import apply_filter_dask
+    return apply_filter_dask(
+        darr=darr,
+        method=config.method,
+        params=config.params,
+        target_dtype=config.target_dtype,
+        normalize=config.normalize,
+        halo=config.halo,
+    )
+
+
 async def fetch_valid_subvolume(
     src_url: str,
     array_subpath: str,
     valid_slices: Tuple[slice, ...],
 ) -> np.ndarray:
     """
-    Fetch a subvolume from the Zarr array, utilizing RawChunkCache.
+    Fetch a subvolume from the Dask-backed Zarr array, utilizing RawChunkCache.
     """
-    raw_cache = get_raw_chunk_cache()
-    # Cache key includes array location and slice bounds
-    slice_key = tuple((s.start, s.stop) for s in valid_slices)
-    cache_key = (src_url, array_subpath, slice_key)
+    darr = await get_dask_array(src_url, array_subpath)
+    sub = darr[valid_slices]
+    return await asyncio.to_thread(sub.compute)
 
-    cached = raw_cache.get(cache_key)
-    if cached is not None:
-        return cached
 
-    zarr_arr = await get_zarr_array(src_url, array_subpath)
-    subvol = await asyncio.to_thread(lambda: zarr_arr[valid_slices])
+def _pad_block(block: np.ndarray, pad_widths: Tuple[Tuple[int, int], ...]) -> np.ndarray:
+    """
+    Pad outer volume boundaries using reflect mode with edge fallback.
+    """
+    if not any(p[0] > 0 or p[1] > 0 for p in pad_widths):
+        return block.astype(np.float32, copy=False)
+    b_float = block.astype(np.float32, copy=False)
+    try:
+        return np.pad(b_float, pad_widths, mode="reflect")
+    except ValueError:
+        return np.pad(b_float, pad_widths, mode="edge")
 
-    raw_cache.put(cache_key, subvol)
-    return subvol
+
+def _filter_block(
+    block: np.ndarray,
+    method: str,
+    params: Dict[str, Any],
+    target_dtype: str,
+    normalize: bool,
+) -> np.ndarray:
+    """
+    Apply volumetric filter on block in worker thread.
+    Handles 2D, 3D, and leading non-spatial dimensions.
+    """
+    if block.ndim <= 3:
+        return apply_filter(
+            volume=block,
+            method=method,
+            params=params,
+            target_dtype=target_dtype,
+            normalize=normalize,
+        )
+    else:
+        out = np.empty(block.shape, dtype=np.dtype(target_dtype))
+        leading_shape = block.shape[:-3]
+        for leading_idx in itertools.product(*(range(s) for s in leading_shape)):
+            out[leading_idx] = apply_filter(
+                volume=block[leading_idx],
+                method=method,
+                params=params,
+                target_dtype=target_dtype,
+                normalize=normalize,
+            )
+        return out
+
+
+def _embed_block(block: np.ndarray, chunk_shape: Tuple[int, ...], target_dtype: str) -> np.ndarray:
+    """
+    Embed a cropped edge chunk in the full regular chunk shape per Zarr v3 specification.
+    """
+    if tuple(block.shape) == tuple(chunk_shape):
+        return block
+    full_chunk = np.zeros(chunk_shape, dtype=np.dtype(target_dtype))
+    embed_slices = tuple(slice(0, s) for s in block.shape)
+    full_chunk[embed_slices] = block
+    return full_chunk
 
 
 def _run_filter_and_crop(
@@ -248,37 +378,17 @@ def _run_filter_and_crop(
     config: ProxyConfig,
 ) -> np.ndarray:
     """
-    Execute filter on the padded subvolume and crop back to the target chunk.
-    Handles 2D, 3D, and leading non-spatial dimensions (e.g. Channel or Time).
+    Synchronous helper preserved for direct testing and compatibility.
     """
+    filtered_subvol = _filter_block(
+        subvol,
+        method=config.method,
+        params=config.params,
+        target_dtype=config.target_dtype,
+        normalize=config.normalize,
+    )
+
     ndim = subvol.ndim
-
-    if ndim <= 3:
-        filtered_subvol = apply_filter(
-            volume=subvol,
-            method=config.method,
-            params=config.params,
-            target_dtype=config.target_dtype,
-            normalize=config.normalize,
-        )
-    else:
-        # For 4D/5D, apply 3D filter across spatial axes (last 3 dimensions)
-        filtered_subvol = np.empty_like(
-            subvol, dtype=np.dtype(config.target_dtype)
-        )
-        leading_shape = subvol.shape[:-3]
-        for leading_idx in itertools.product(*(range(s) for s in leading_shape)):
-            spatial_slice = subvol[leading_idx]
-            filt_spatial = apply_filter(
-                volume=spatial_slice,
-                method=config.method,
-                params=config.params,
-                target_dtype=config.target_dtype,
-                normalize=config.normalize,
-            )
-            filtered_subvol[leading_idx] = filt_spatial
-
-    # Crop away the halo
     crop_slices = []
     for i in range(ndim):
         h_i = halo[i] if i < len(halo) else 0
@@ -286,15 +396,106 @@ def _run_filter_and_crop(
         crop_slices.append(slice(h_i, h_i + t_len))
 
     cropped = filtered_subvol[tuple(crop_slices)]
+    return _embed_block(cropped, tuple(chunk_shape), config.target_dtype)
 
-    # Embed in full chunk_shape buffer per Zarr v3 regular grid specification
-    if list(cropped.shape) != list(chunk_shape):
-        full_chunk = np.zeros(chunk_shape, dtype=np.dtype(config.target_dtype))
-        embed_slices = tuple(slice(0, s) for s in cropped.shape)
-        full_chunk[embed_slices] = cropped
-        return full_chunk
 
-    return cropped
+def build_chunk_dask_graph(
+    config: ProxyConfig,
+    darr: da.Array,
+    target_coords: Tuple[int, ...],
+    shape: List[int],
+    chunk_shape: List[int],
+    halo: List[int],
+) -> da.Array:
+    """
+    Construct a localized lazy Dask graph targeting ONLY the requested chunk region + halo.
+    Dask evaluates only the intersecting chunks needed for this specific region on a need basis.
+    """
+    ndim = len(shape)
+    t_start = []
+    t_end = []
+    v_start = []
+    v_end = []
+    pad_left = []
+    pad_right = []
+    target_lengths = []
+
+    for i in range(ndim):
+        c_i = target_coords[i]
+        d_i = shape[i]
+        s_i = chunk_shape[i]
+        h_i = halo[i] if i < len(halo) else 0
+
+        start_idx = c_i * s_i
+        end_idx = min((c_i + 1) * s_i, d_i)
+        t_start.append(start_idx)
+        t_end.append(end_idx)
+        target_lengths.append(end_idx - start_idx)
+
+        desired_start = start_idx - h_i
+        desired_end = end_idx + h_i
+
+        # External padding required at dataset boundaries
+        p_left = max(0, -desired_start)
+        p_right = max(0, desired_end - d_i)
+        pad_left.append(p_left)
+        pad_right.append(p_right)
+
+        # Region within dataset boundaries
+        valid_s = max(0, desired_start)
+        valid_e = min(d_i, desired_end)
+        v_start.append(valid_s)
+        v_end.append(valid_e)
+
+    valid_slices = tuple(slice(v_start[i], v_end[i]) for i in range(ndim))
+    pad_widths = tuple((pad_left[i], pad_right[i]) for i in range(ndim))
+    crop_slices = tuple(
+        slice(halo[i] if i < len(halo) else 0, (halo[i] if i < len(halo) else 0) + target_lengths[i])
+        for i in range(ndim)
+    )
+
+    # 1. Lazily slice only the required valid region from Dask array and rechunk to a unified task
+    sub_da = darr[valid_slices].rechunk((-1,) * ndim)
+    padded_shape = tuple(s + p[0] + p[1] for s, p in zip(sub_da.shape, pad_widths))
+
+    # 2. Lazily pad boundaries
+    padded_da = da.map_blocks(
+        _pad_block,
+        sub_da,
+        pad_widths=pad_widths,
+        chunks=tuple((s,) for s in padded_shape),
+        dtype=np.float32,
+    )
+
+    # 3. Lazily apply volumetric filter and normalization/casting
+    filt_da = da.map_blocks(
+        _filter_block,
+        padded_da,
+        method=config.method,
+        params=config.params,
+        target_dtype=config.target_dtype,
+        normalize=config.normalize,
+        chunks=tuple((s,) for s in padded_shape),
+        dtype=np.dtype(config.target_dtype),
+    )
+
+    # 4. Crop away the halo
+    cropped_da = filt_da[crop_slices]
+
+    # 5. Embed in regular chunk_shape if edge chunk
+    if tuple(target_lengths) != tuple(chunk_shape):
+        chunk_da = da.map_blocks(
+            _embed_block,
+            cropped_da,
+            chunk_shape=tuple(chunk_shape),
+            target_dtype=config.target_dtype,
+            chunks=tuple((s,) for s in chunk_shape),
+            dtype=np.dtype(config.target_dtype),
+        )
+    else:
+        chunk_da = cropped_da
+
+    return chunk_da
 
 
 async def process_chunk_request(
@@ -306,8 +507,8 @@ async def process_chunk_request(
     1. Check ProcessedChunkCache.
     2. Resolve array and chunk coords.
     3. Calculate required halo context.
-    4. Fetch needed subvolume with universal Zarr v3 decoding (including sharding).
-    5. Stitch, pad, filter, and crop in worker thread.
+    4. Construct localized lazy Dask graph targeting ONLY the requested chunk region.
+    5. Evaluate Dask graph on-demand in worker thread / scheduler.
     6. Compress using falsified codec and cache.
     """
     processed_cache = get_processed_chunk_cache()
@@ -339,69 +540,30 @@ async def process_chunk_request(
     else:
         halo = spatial_halo[-ndim:]
 
-    # Calculate bounding boxes
-    t_start = []
-    t_end = []
-    v_start = []
-    v_end = []
-    pad_left = []
-    pad_right = []
-    target_lengths = []
+    # Get lazy Dask array backed by CachedZarrArray
+    darr = await get_dask_array(config.src_url, array_subpath)
 
-    for i in range(ndim):
-        c_i = target_coords[i]
-        d_i = shape[i]
-        s_i = chunk_shape[i]
-        h_i = halo[i] if i < len(halo) else 0
+    # Construct localized lazy Dask graph targeting ONLY this chunk
+    chunk_da = build_chunk_dask_graph(
+        config=config,
+        darr=darr,
+        target_coords=target_coords,
+        shape=shape,
+        chunk_shape=chunk_shape,
+        halo=halo,
+    )
 
-        start_idx = c_i * s_i
-        end_idx = min((c_i + 1) * s_i, d_i)
-        t_start.append(start_idx)
-        t_end.append(end_idx)
-        target_lengths.append(end_idx - start_idx)
+    # Execute computation on-demand via Dask scheduler
+    computed_chunk = await asyncio.to_thread(chunk_da.compute)
 
-        desired_start = start_idx - h_i
-        desired_end = end_idx + h_i
-
-        # External padding required at dataset edges
-        p_left = max(0, -desired_start)
-        p_right = max(0, desired_end - d_i)
-        pad_left.append(p_left)
-        pad_right.append(p_right)
-
-        # Region within dataset boundaries
-        valid_s = max(0, desired_start)
-        valid_e = min(d_i, desired_end)
-        v_start.append(valid_s)
-        v_end.append(valid_e)
-
-    valid_slices = tuple(slice(v_start[i], v_end[i]) for i in range(ndim))
-
-    # Fetch valid subvolume using universal Zarr v3 array loader
-    valid_subvol = await fetch_valid_subvolume(config.src_url, array_subpath, valid_slices)
-
-    # Perform padding, filtering, cropping, and compression in worker thread
-    def _compute_sync():
-        pad_widths = tuple((pad_left[i], pad_right[i]) for i in range(ndim))
-        if any(p[0] > 0 or p[1] > 0 for p in pad_widths):
-            try:
-                padded = np.pad(valid_subvol.astype(np.float32, copy=False), pad_widths, mode="reflect")
-            except ValueError:
-                padded = np.pad(valid_subvol.astype(np.float32, copy=False), pad_widths, mode="edge")
-        else:
-            padded = valid_subvol.astype(np.float32, copy=False)
-
-        output_chunk = _run_filter_and_crop(padded, halo, target_lengths, chunk_shape, config)
-
-        compressed = encode_chunk_bytes(
-            output_chunk,
-            compression=config.compression,
-            cname=config.cname,
-            clevel=config.clevel,
-        )
-        return compressed
-
-    compressed_bytes = await asyncio.to_thread(_compute_sync)
+    # Compress using falsified codec
+    compressed_bytes = await asyncio.to_thread(
+        encode_chunk_bytes,
+        computed_chunk,
+        compression=config.compression,
+        cname=config.cname,
+        clevel=config.clevel,
+    )
 
     # Cache into Processed Chunk Cache
     processed_cache.put(proc_cache_key, compressed_bytes)

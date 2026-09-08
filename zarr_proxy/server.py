@@ -73,10 +73,17 @@ async def health():
 async def cache_stats():
     raw_cache = get_raw_chunk_cache()
     proc_cache = get_processed_chunk_cache()
+    dask_scheduler = os.environ.get("DASK_SCHEDULER_ADDRESS")
     return {
         "raw_chunk_cache": raw_cache.stats(),
         "processed_chunk_cache": proc_cache.stats(),
+        "dask": {
+            "engine": "dask.array",
+            "scheduler": "distributed" if dask_scheduler else "threads",
+            "distributed_address": dask_scheduler,
+        },
     }
+
 
 
 @app.post("/_encode", tags=["Utility"])

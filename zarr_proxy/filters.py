@@ -188,3 +188,66 @@ def apply_filter(
         raise ValueError(f"Unknown filter method '{method}'")
 
     return normalize_and_cast(filtered, target_dtype=target_dtype, normalize=normalize, params=params)
+
+
+def apply_filter_dask(
+    darr: Any,
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+    target_dtype: str = "uint8",
+    normalize: bool = True,
+    halo: Optional[Union[int, List[int]]] = None,
+    boundary: str = "reflect",
+) -> Any:
+    """
+    Apply volumetric filter to a lazy Dask array.
+    If halo/ghost cells are needed, uses dask.array.map_overlap; otherwise uses dask.array.map_blocks.
+    Returns a lazy Dask array.
+    """
+    import dask.array as da
+
+    params = params or {}
+    ndim = darr.ndim
+    spatial_ndim = min(3, ndim)
+    spatial_halo = calculate_halo(method, params, halo, ndim=spatial_ndim)
+    if ndim > 3:
+        depth = [0] * (ndim - 3) + spatial_halo
+    else:
+        depth = spatial_halo[-ndim:]
+
+    def _block_func(block: np.ndarray) -> np.ndarray:
+        if block.ndim <= 3:
+            return apply_filter(
+                volume=block,
+                method=method,
+                params=params,
+                target_dtype=target_dtype,
+                normalize=normalize,
+            )
+        else:
+            import itertools
+            out = np.empty(block.shape, dtype=np.dtype(target_dtype))
+            leading_shape = block.shape[:-3]
+            for idx in itertools.product(*(range(s) for s in leading_shape)):
+                out[idx] = apply_filter(
+                    volume=block[idx],
+                    method=method,
+                    params=params,
+                    target_dtype=target_dtype,
+                    normalize=normalize,
+                )
+            return out
+
+    out_dtype = np.dtype(target_dtype)
+    if all(h == 0 for h in depth):
+        return darr.map_blocks(_block_func, dtype=out_dtype)
+
+    return darr.map_overlap(
+        _block_func,
+        depth=tuple(depth),
+        boundary=boundary,
+        dtype=out_dtype,
+        trim=True,
+        allow_rechunk=True,
+    )
+

@@ -20,7 +20,10 @@ cachetools = ">=5.5"
 httpx = ">=0.27"
 pytest = ">=8.0"
 pytest-asyncio = ">=0.24"
+dask = ">=2026.8.0,<2027"
 
 [tasks]
 test = { cmd = "pytest -v tests/", env = { PYTHONPATH = "." } }
-proxy = { cmd = "uvicorn zarr_proxy.server:app --host 0.0.0.0 --port 8000 --reload", env = { PYTHONPATH = "." } }
+proxy = { cmd = "uvicorn zarr_proxy.server:app --host 0.0.0.0 --port 8000 --workers 16", env = { PYTHONPATH = ".", OMP_NUM_THREADS = "2", OPENBLAS_NUM_THREADS = "2" } }
+proxy-dev = { cmd = "uvicorn zarr_proxy.server:app --host 0.0.0.0 --port 8000 --reload", env = { PYTHONPATH = "." } }
+proxy-max = { cmd = "uvicorn zarr_proxy.server:app --host 0.0.0.0 --port 8000 --workers 32", env = { PYTHONPATH = ".", OMP_NUM_THREADS = "2", OPENBLAS_NUM_THREADS = "2" } }

@@ -19,10 +19,11 @@ The proxy intercepts chunk requests on-the-fly, fetches necessary spatial contex
    - Intercepts requests for `zarr.json` (at dataset root and multiscale levels like `s0/zarr.json`).
    - Automatically modifies `data_type` (e.g. `float32` -> `uint8`).
    - Adjusts codec pipeline (`bytes` codec + `blosc` with `typesize: 1` or `gzip`/uncompressed) to match outgoing streams.
-4. **Boundary "Halo" Fetching & Stitching:**
+4. **Dask-Powered On-Demand Volumetric Pipeline & Halo Stitching:**
+   - Evaluates only the regions requested by Neuroglancer/user on a strict need basis using lazy Dask graphs (`dask.array`).
    - Automatically computes required halo padding based on filter kernel support (e.g. $\lceil 3 \times \max(\sigma) \rceil$).
-   - Concurrently fetches intersecting adjacent chunks.
-   - Stitches chunks, pads outer volume boundaries with reflection/edge modes, applies filters in background worker threads, and crops away the halo to eliminate edge artifacts.
+   - Intersecting adjacent chunks are transparently cached through `CachedZarrArray` into `RawChunkCache`.
+   - Pads outer volume boundaries with reflection/edge modes, executes filters via Dask, and crops away the halo to eliminate edge artifacts.
 5. **CORS & Zero-Config Neuroglancer Integration:**
    - Full CORS headers (`Access-Control-Allow-Origin: *`).
    - Direct support for `zarr3://` source URLs in Neuroglancer.
@@ -34,6 +35,7 @@ The proxy intercepts chunk requests on-the-fly, fetches necessary spatial contex
 * **Environment Manager:** [Pixi](https://pixi.sh)
 * **Web Framework:** FastAPI, Uvicorn, Starlette
 * **Data & Codecs:** `zarr` (v3+), `numcodecs`, `s3fs`, `fsspec`
+* **Parallel & Distributed Computing:** `dask` (v2026+), `dask.array`, `distributed`
 * **Computation:** `numpy`, `scikit-image`, `scipy`
 * **Caching:** `cachetools` (thread-safe byte-bounded `LRUCache`)
 
@@ -119,9 +121,30 @@ The `config_payload` in `/{config_payload}/{zarr_path:path}` is a URL-safe Base6
 ## Monitoring & Endpoints
 
 * `GET /_health`: Health status and proxy version.
-* `GET /_stats`: Real-time cache utilization, item counts, byte usage, and cache hit ratios.
+* `GET /_stats`: Real-time cache utilization, item counts, byte usage, and Dask engine status.
 * `POST /_encode`: Utility API to generate configuration payloads from JSON.
 * `GET /{config_payload}/{zarr_path:path}`: Dynamic Neuroglancer proxy route for metadata and chunks.
+
+---
+
+## Dask Lazy Processing Architecture
+
+1. **On-Demand Localized Compute:**
+   Chunk requests trigger localized Dask computation graphs targeting *only* the specific spatial coordinates and halo boundaries needed. Unrequested chunks and distant subvolumes are never evaluated.
+2. **Transparent Chunk Caching:**
+   All chunk slices read by Dask pass through `CachedZarrArray`, which transparently populates the thread-safe `RawChunkCache`. Adjacent halo reads seamlessly reuse already-loaded chunks.
+3. **Full-Volume Dask API:**
+   Python clients can directly construct lazy Dask arrays for downstream analysis:
+   ```python
+   from zarr_proxy.processor import get_filtered_dask_array
+   from zarr_proxy.config import ProxyConfig
+
+   cfg = ProxyConfig(src_url="s3://bucket/volume.zarr", method="frangi")
+   darr = await get_filtered_dask_array(cfg)  # returns da.Array
+   ```
+4. **Distributed Cluster Support (Optional):**
+   Set `DASK_SCHEDULER_ADDRESS="tcp://scheduler:8786"` in the environment to automatically dispatch chunk filtering tasks across a distributed Dask cluster. By default, tasks execute using Dask's high-performance multi-threaded local scheduler.
+
 
 ---
 

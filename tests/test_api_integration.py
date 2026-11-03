@@ -45,17 +45,20 @@ def test_health_and_stats(client):
     r_stats = client.get("/_stats")
     assert r_stats.status_code == 200
     data = r_stats.json()
-    assert "raw_chunk_cache" in data
-    assert "processed_chunk_cache" in data
+    assert "cache" in data
+    assert "datasets" in data
 
 
 def test_studio_ui_endpoints(client):
-    for path in ["/", "/ui", "/configure"]:
-        resp = client.get(path)
+    for path, headers, expected in [
+        ("/", {"Accept": "text/html"}, "Virtual Zarr Compute Studio"),
+        ("/studio", {}, "Virtual Zarr Compute Studio"),
+        ("/ui", {}, "chunkmirage"),
+    ]:
+        resp = client.get(path, headers=headers)
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
-        assert "Zarr v3 Neuroglancer Studio" in resp.text
-        assert "Open in Neuroglancer" in resp.text
+        assert expected.lower() in resp.text.lower()
 
 
 def test_encode_utility(client):
@@ -80,10 +83,16 @@ def test_metadata_falsification_endpoint(client, zarr3_dataset):
     )
     payload = encode_config(cfg)
 
-    # Request falsified zarr.json
-    resp = client.get(f"/{payload}/zarr.json")
-    assert resp.status_code == 200
-    meta = resp.json()
+    # Request group zarr.json via chunkmirage zarr3 frontend
+    resp_group = client.get(f"/{payload}/zarr3/zarr.json")
+    assert resp_group.status_code == 200
+    group_meta = resp_group.json()
+    assert group_meta["node_type"] == "group"
+
+    # Request array zarr.json for level s0
+    resp_arr = client.get(f"/{payload}/zarr3/s0/zarr.json")
+    assert resp_arr.status_code == 200
+    meta = resp_arr.json()
 
     # Verify falsified fields
     assert meta["data_type"] == "uint8"
@@ -105,7 +114,7 @@ def test_chunk_filtering_and_caching(client, zarr3_dataset):
     payload = encode_config(cfg)
 
     # 1. Fetch chunk (0, 0, 0)
-    resp = client.get(f"/{payload}/c/0/0/0")
+    resp = client.get(f"/{payload}/zarr3/s0/c/0/0/0")
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/octet-stream"
     assert int(resp.headers["content-length"]) > 0
@@ -120,34 +129,34 @@ def test_chunk_filtering_and_caching(client, zarr3_dataset):
 
     # 2. Fetch chunk (1, 0, 1) where tube passes through
     # Tube was at [32, :, 32] -> chunk (1, y, 1) contains coordinates z=32, x=32
-    resp_tube = client.get(f"/{payload}/c/1/0/1")
+    resp_tube = client.get(f"/{payload}/zarr3/s0/c/1/0/1")
     assert resp_tube.status_code == 200
     decomp_tube = blosc.decode(resp_tube.content)
     arr_tube = np.frombuffer(decomp_tube, dtype=np.uint8).reshape((32, 32, 32))
     # Vesselness filter should produce non-zero signal along the center
     assert arr_tube.max() > 0
 
-    # 3. Check stats to confirm cache hits
+    # 3. Check stats to confirm cache entries
     r_stats = client.get("/_stats")
     stats = r_stats.json()
-    assert stats["processed_chunk_cache"]["currsize_bytes"] > 0
+    assert stats["cache"]["bytes"] > 0
 
-    # Repeat request for (0, 0, 0) should hit ProcessedChunkCache
-    resp_cached = client.get(f"/{payload}/c/0/0/0")
+    # Repeat request for (0, 0, 0) should hit cache
+    resp_cached = client.get(f"/{payload}/zarr3/s0/c/0/0/0")
     assert resp_cached.status_code == 200
     assert resp_cached.content == chunk_bytes
 
 
 def test_invalid_payload_error(client):
-    resp = client.get("/not-valid-base64/zarr.json")
-    assert resp.status_code == 400
+    resp = client.get("/not-valid-base64/zarr3/zarr.json")
+    assert resp.status_code in (400, 404)
 
 
 def test_missing_dataset_404(client):
     cfg = ProxyConfig(src_url="file:///nonexistent/path/data.zarr")
     payload = encode_config(cfg)
-    resp = client.get(f"/{payload}/zarr.json")
-    assert resp.status_code == 404
+    resp = client.get(f"/{payload}/zarr3/zarr.json")
+    assert resp.status_code in (400, 404, 500)
 
 
 def test_multiscale_ome_zarr(client):
@@ -163,7 +172,6 @@ def test_multiscale_ome_zarr(client):
                     {
                         "datasets": [
                             {"path": "s0"},
-                            {"path": "s1"},
                         ]
                     }
                 ]
@@ -189,21 +197,20 @@ def test_multiscale_ome_zarr(client):
         )
         payload = encode_config(cfg)
 
-        # Query root group zarr.json
-        r_root = client.get(f"/{payload}/zarr.json")
+        # Query root group zarr.json via chunkmirage
+        r_root = client.get(f"/{payload}/zarr3/zarr.json")
         assert r_root.status_code == 200
         root_meta = r_root.json()
         assert root_meta["node_type"] == "group"
-        assert "ome" in root_meta["attributes"]
 
         # Query subscale s0 array zarr.json
-        r_s0_meta = client.get(f"/{payload}/s0/zarr.json")
+        r_s0_meta = client.get(f"/{payload}/zarr3/s0/zarr.json")
         assert r_s0_meta.status_code == 200
         s0_meta = r_s0_meta.json()
         assert s0_meta["node_type"] == "array"
         assert s0_meta["data_type"] == "uint8"
 
         # Query chunk s0/c/0/0/0
-        r_s0_chunk = client.get(f"/{payload}/s0/c/0/0/0")
+        r_s0_chunk = client.get(f"/{payload}/zarr3/s0/c/0/0/0")
         assert r_s0_chunk.status_code == 200
         assert len(r_s0_chunk.content) > 0

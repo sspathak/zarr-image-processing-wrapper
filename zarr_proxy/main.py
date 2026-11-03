@@ -1,16 +1,17 @@
 """
-CLI entry point for running the proxy server or encoding config payloads.
+CLI entry point for running the virtual Zarr compute server or encoding pipeline specs.
 """
 
 import argparse
+import json
 import sys
 import uvicorn
-from zarr_proxy.config import ProxyConfig, encode_config
+from zarr_proxy.resolver import encode_payload
 
 
 def run_server():
     parser = argparse.ArgumentParser(
-        description="Zarr v3 Neuroglancer Volumetric Filtering Proxy Server"
+        description="Virtual Zarr Compute Server powered by chunkmirage"
     )
     parser.add_argument("--host", default="0.0.0.0", help="Host address to bind to (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
@@ -20,30 +21,33 @@ def run_server():
     subparsers = parser.add_subparsers(dest="command", help="Subcommands")
 
     # Subcommand: encode
-    encode_parser = subparsers.add_parser("encode", help="Encode a config payload for Neuroglancer")
+    encode_parser = subparsers.add_parser("encode", help="Encode a pipeline specification into a URL payload")
     encode_parser.add_argument("--src-url", required=True, help="Source S3 / URL to Zarr dataset")
-    encode_parser.add_argument("--method", default="frangi", help="Filter method (frangi, sato, gaussian, etc.)")
+    encode_parser.add_argument("--method", default="frangi", help="Filter method (frangi, sato, gaussian, otsu, etc.)")
     encode_parser.add_argument("--sigmas", nargs="+", type=float, default=[1.0, 2.0], help="Sigmas for filter")
-    encode_parser.add_argument("--halo", type=int, default=None, help="Explicit halo radius in voxels")
     encode_parser.add_argument("--target-dtype", default="uint8", help="Target output data type")
-    encode_parser.add_argument("--proxy-host", default="http://128.40.89.2:8000", help="Proxy server address (default: http://128.40.89.2:8000)")
+    encode_parser.add_argument("--proxy-host", default="http://localhost:8000", help="Proxy server address")
+    encode_parser.add_argument("--compress", action="store_true", help="Use ngplatform deflate-raw compression")
 
     args = parser.parse_args()
 
     if args.command == "encode":
-        cfg = ProxyConfig(
-            src_url=args.src_url,
-            method=args.method,
-            params={"sigmas": args.sigmas},
-            halo=args.halo,
-            target_dtype=args.target_dtype,
-        )
-        payload = encode_config(cfg)
+        ops = [{"op": args.method, "sigmas": args.sigmas}]
+        if args.target_dtype and args.target_dtype != "float32":
+            ops.append({"op": "cast", "dtype": args.target_dtype})
+
+        spec = {
+            "source": args.src_url,
+            "ops": ops,
+        }
+        payload = encode_payload(spec, compress=args.compress)
         proxy_host = args.proxy_host.rstrip("/")
-        print("Configuration Payload:")
+        print("Pipeline Specification JSON:")
+        print(json.dumps(spec, indent=2))
+        print("\nURL-safe Payload:")
         print(payload)
         print("\nNeuroglancer Layer Source URL:")
-        print(f"zarr3://{proxy_host}/{payload}")
+        print(f"zarr3://{proxy_host}/{payload}/zarr3")
         sys.exit(0)
 
     uvicorn.run(

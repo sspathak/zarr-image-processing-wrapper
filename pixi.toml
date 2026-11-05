@@ -30,4 +30,4 @@ proxy-dev = { cmd = "uvicorn zarr_proxy.server:app --host 0.0.0.0 --port 8000 --
 proxy-max = { cmd = "uvicorn zarr_proxy.server:app --host 0.0.0.0 --port 8000 --workers 32", env = { PYTHONPATH = ".", OMP_NUM_THREADS = "2", OPENBLAS_NUM_THREADS = "2" } }
 
 [pypi-dependencies]
-chunkmirage = { path = "../chunkmirage", editable = true }
+chunkmirage = { git = "https://github.com/JaneliaSciComp/chunkmirage.git" }

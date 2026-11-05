@@ -27,6 +27,12 @@ def run_server():
     encode_parser.add_argument("--sigmas", nargs="+", type=float, default=[1.0, 2.0], help="Sigmas for filter")
     encode_parser.add_argument("--target-dtype", default="uint8", help="Target output data type")
     encode_parser.add_argument("--proxy-host", default="http://localhost:8000", help="Proxy server address")
+    encode_parser.add_argument(
+        "--backend",
+        choices=["local", "dask", "webworker", "workstation"],
+        default="local",
+        help="Compute backend target (local, dask, webworker, workstation)",
+    )
     encode_parser.add_argument("--compress", action="store_true", help="Use ngplatform deflate-raw compression")
 
     args = parser.parse_args()
@@ -40,14 +46,23 @@ def run_server():
             "source": args.src_url,
             "ops": ops,
         }
-        payload = encode_payload(spec, compress=args.compress)
         proxy_host = args.proxy_host.rstrip("/")
+        if args.backend == "webworker":
+            from zarr_proxy.backends.webworker import build_ngplatform_url, to_ngplatform_pipeline
+
+            spec = to_ngplatform_pipeline(spec, compile_ops=True)
+            payload = encode_payload(spec, compress=True)
+            ng_source = build_ngplatform_url(spec, base_url=f"{proxy_host}/", compile_ops=False)
+        else:
+            payload = encode_payload(spec, compress=args.compress)
+            ng_source = f"zarr3://{proxy_host}/{payload}/zarr3"
+
         print("Pipeline Specification JSON:")
         print(json.dumps(spec, indent=2))
         print("\nURL-safe Payload:")
         print(payload)
         print("\nNeuroglancer Layer Source URL:")
-        print(f"zarr3://{proxy_host}/{payload}/zarr3")
+        print(ng_source)
         sys.exit(0)
 
     uvicorn.run(

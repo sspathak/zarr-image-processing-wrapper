@@ -7,8 +7,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import zlib
 from typing import Any, Dict, Optional
+import zlib
 from chunkmirage.pipeline import PipelineSpec
 
 log = logging.getLogger("zarr_proxy.resolver")
@@ -90,8 +90,33 @@ def convert_legacy_config(data: Dict[str, Any]) -> Dict[str, Any]:
     spec: Dict[str, Any] = {"source": src_url, "ops": ops}
     if "chunk_shape" in data:
         spec["chunk_shape"] = data["chunk_shape"]
+    elif "chunk" in data:
+        spec["chunk_shape"] = data["chunk"]
 
     return spec
+
+
+def _normalize_pipeline_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize an incoming pipeline dictionary (including `ngplatform` `ComputedPipeline`
+    specs with `chunk` or WebWorker `python` ops) into a valid `PipelineSpec` dictionary.
+    """
+    from zarr_proxy.backends.webworker import decompile_webworker_op
+
+    norm = dict(data)
+    # Map ngplatform's `chunk` field to chunkmirage's `chunk_shape`
+    if "chunk" in norm and "chunk_shape" not in norm:
+        norm["chunk_shape"] = norm.pop("chunk")
+    else:
+        norm.pop("chunk", None)
+
+    # Strip optional backend routing metadata before validating PipelineSpec
+    norm.pop("backend", None)
+
+    if "ops" in norm and isinstance(norm["ops"], list):
+        norm["ops"] = [decompile_webworker_op(o) for o in norm["ops"]]
+
+    return norm
 
 
 def dynamic_pipeline_resolver(name: str) -> Optional[PipelineSpec | Dict[str, Any]]:
@@ -114,12 +139,12 @@ def dynamic_pipeline_resolver(name: str) -> Optional[PipelineSpec | Dict[str, An
             spec_dict = convert_legacy_config(data)
             return PipelineSpec.model_validate(spec_dict)
 
-        # Standard PipelineSpec format
+        # Standard PipelineSpec or ngplatform ComputedPipeline format
         if "source" in data:
-            return PipelineSpec.model_validate(data)
+            spec_dict = _normalize_pipeline_dict(data)
+            return PipelineSpec.model_validate(spec_dict)
 
         return None
     except Exception as e:
         log.debug("Name '%s' not resolvable as pipeline spec: %s", name, e)
         return None
-

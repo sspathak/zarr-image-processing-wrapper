@@ -802,7 +802,7 @@ UI_HTML = r"""<!DOCTYPE html>
                         <span>Compute Backend</span>
                         <span class="info-icon">i</span>
                         <span class="tooltip-text">
-                            <strong>Pluggable Compute Layer:</strong><br>
+                            <strong>Server Compute Layer:</strong><br>
                             Switch between Local (multi-threaded NumPy/SciPy in-process), Dask (distributed chunk graph execution), and Workstation (remote execution) backends.
                         </span>
                     </label>
@@ -953,7 +953,7 @@ UI_HTML = r"""<!DOCTYPE html>
             hoa_heart_https: "https://storage.googleapis.com/ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr",
             hoa_heart_gs: "gs://ucl-hip-ct-35a68e99feaae8932b1d44da0358940b/LADAF-2021-17/heart/8.01um_complete-organ_bm18.ome.zarr",
             flyem: "s3://neuroglancer-janelia-flyem-hemibrain/v1.2/groundtruth.zarr",
-            synthetic: "synthetic://blob?shape=256,256,256"
+            synthetic: "synthetic://blobs?shape=256,256,256"
         };
 
         function setPipelineMode(mode) {
@@ -1306,6 +1306,7 @@ UI_HTML = r"""<!DOCTYPE html>
         function buildPipelineSpec() {
             const srcUrl = document.getElementById('src_url').value.trim();
             const targetDtype = document.getElementById('target_dtype').value;
+            const backend = document.getElementById('compute_backend').value;
 
             const opsList = JSON.parse(JSON.stringify(steps));
             if (targetDtype !== 'original' && targetDtype !== 'float32') {
@@ -1318,6 +1319,7 @@ UI_HTML = r"""<!DOCTYPE html>
 
             return {
                 source: srcUrl,
+                backend: backend,
                 ops: opsList
             };
         }

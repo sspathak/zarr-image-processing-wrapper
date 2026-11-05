@@ -1,6 +1,9 @@
+import tempfile
+import numcodecs
 import numpy as np
 import pytest
 from starlette.testclient import TestClient
+import zarr
 
 from chunkmirage import Pipeline
 from chunkmirage.core import ArrayInfo
@@ -124,3 +127,97 @@ def test_stateless_payload_and_dataset_chaining(client):
     r_chunk = client.get(f"/{payload}/zarr3/s0/c/0/0/0")
     assert r_chunk.status_code == 200
     assert len(r_chunk.content) > 0
+
+
+def test_webworker_and_workstation_endpoints(client):
+    # 1. WebWorker status & worker script
+    r_ww = client.get("/_webworker/status")
+    assert r_ww.status_code == 200
+    assert r_ww.json()["backend"] == "webworker"
+
+    r_js = client.get("/_webworker/worker.js")
+    assert r_js.status_code == 200
+    assert "application/javascript" in r_js.headers["content-type"]
+
+    # 2. WebWorker compile endpoint
+    r_comp = client.post(
+        "/_webworker/compile",
+        json={
+            "source": "dataset://chain_base",
+            "ops": [{"op": "sato", "sigmas": [1.0, 2.0]}, {"op": "li", "value": 1}],
+            "chunk": [16, 16, 16],
+        },
+    )
+    assert r_comp.status_code == 200
+    comp_data = r_comp.json()
+    assert "/virtual/ngp/" in comp_data["neuroglancer_source"]
+    ngp_payload = comp_data["payload"]
+
+    # 3. Verify that an ngplatform-compiled WebWorker payload can ALSO be resolved
+    # directly by the workstation server (auto-decompiling python ops to native ops)
+    r_ngp_chunk = client.get(f"/{ngp_payload}/zarr3/s0/c/0/0/0")
+    assert r_ngp_chunk.status_code == 200
+    assert len(r_ngp_chunk.content) > 0
+
+    # 4. Workstation status endpoint
+    r_ws = client.get("/_workstation/status")
+    assert r_ws.status_code == 200
+    assert r_ws.json()["backend"] == "workstation"
+
+
+def test_local_zarr3_and_multiscale_ome_zarr_serving(client):
+    """Test end-to-end serving of a real Zarr v3 / OME-Zarr 0.5 multiscale dataset on disk."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = zarr.storage.LocalStore(tmpdir)
+        root_group = zarr.create_group(store=store, zarr_format=3)
+        root_group.attrs.put({
+            "ome": {
+                "version": "0.5",
+                "multiscales": [{"datasets": [{"path": "s0"}]}],
+            }
+        })
+        s0 = zarr.create_array(
+            store=store,
+            name="s0",
+            shape=(64, 64, 64),
+            chunks=(32, 32, 32),
+            dtype="float32",
+            zarr_format=3,
+        )
+        data = np.zeros((64, 64, 64), dtype=np.float32)
+        data[32, :, 32] = 50.0
+        s0[:] = data
+
+        spec = {
+            "source": f"file://{tmpdir}",
+            "ops": [
+                {"op": "frangi", "sigmas": [1.0, 2.0]},
+                {"op": "scale", "factor": 255.0},
+                {"op": "cast", "dtype": "uint8"},
+            ],
+        }
+        payload = encode_payload(spec, compress=True)
+
+        # Group metadata
+        r_group = client.get(f"/{payload}/zarr3/zarr.json")
+        assert r_group.status_code == 200
+        assert r_group.json()["node_type"] == "group"
+
+        # Array metadata
+        r_arr = client.get(f"/{payload}/zarr3/s0/zarr.json")
+        assert r_arr.status_code == 200
+        meta = r_arr.json()
+        assert meta["node_type"] == "array"
+        assert meta["data_type"] == "uint8"
+        assert meta["shape"] == [64, 64, 64]
+
+        # Filtered chunk (1, 0, 1) containing the synthetic vessel
+        r_chunk = client.get(f"/{payload}/zarr3/s0/c/1/0/1")
+        assert r_chunk.status_code == 200
+        blosc = numcodecs.Blosc(cname="zstd")
+        arr_tube = np.frombuffer(blosc.decode(r_chunk.content), dtype=np.uint8).reshape((32, 32, 32))
+        assert arr_tube.max() > 0
+
+
+
+

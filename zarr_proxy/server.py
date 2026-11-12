@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
@@ -313,6 +314,17 @@ app = create_app(
     extra_routes=extra_routes,
     resolver=dynamic_pipeline_resolver,
     route_plugins=True,
+)
+
+# Configure CORS to allow Neuroglancer and other clients
+cors_middleware = CORSMiddleware(
+    app,
+    allow_origins=[
+        "*",  # Allow all origins (can be restricted to specific domains)
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
